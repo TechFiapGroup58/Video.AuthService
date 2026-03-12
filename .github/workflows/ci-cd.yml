@@ -1,0 +1,163 @@
+name: AuthService CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [develop, main]
+
+env:
+  REGISTRY:    ghcr.io
+  IMAGE_NAME:  ${{ github.repository_owner }}/fiapx-auth-service
+  DOTNET_VER:  "8.0.x"
+
+# ─── Regra: PR para develop exige 80 % de cobertura + aprovação ───────────────
+# A aprovação é configurada no GitHub em Settings > Branches > Branch protection rules
+# (require pull request reviews, require status checks: test / coverage-gate)
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  test:
+    name: Build, Test & Coverage Gate
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER:     fiapx
+          POSTGRES_PASSWORD: fiapx@2024
+          POSTGRES_DB:       fiapx_auth_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VER }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VER }}
+
+      - name: Restore
+        working-directory: AuthService
+        run: dotnet restore
+
+      - name: Build
+        working-directory: AuthService
+        run: dotnet build --no-restore -c Release
+
+      # ── Testes unitários com cobertura ──────────────────────────────────
+      - name: Unit Tests
+        working-directory: AuthService
+        run: |
+          dotnet test tests/AuthService.Tests.csproj \
+            --no-build -c Release \
+            --filter "FullyQualifiedName~Unit" \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ./coverage \
+            -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura
+
+      # ── Testes de integração ────────────────────────────────────────────
+      - name: Integration Tests
+        working-directory: AuthService
+        env:
+          ConnectionStrings__DefaultConnection: >
+            Host=localhost;Port=5432;Database=fiapx_auth_test;Username=fiapx;Password=fiapx@2024
+        run: |
+          dotnet test tests/AuthService.Tests.csproj \
+            --no-build -c Release \
+            --filter "FullyQualifiedName~Integration"
+
+      # ── Gate: mínimo 80 % de cobertura (falha o PR se não atingir) ──────
+      - name: Coverage Gate ≥ 80%
+        uses: irongut/CodeCoverageSummary@v1.3.0
+        with:
+          filename:        "AuthService/coverage/**/coverage.cobertura.xml"
+          badge:           true
+          fail_below_min:  true
+          format:          markdown
+          thresholds:      "80 90"
+          output:          both
+
+      - name: Add Coverage PR Comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        if: github.event_name == 'pull_request'
+        with:
+          recreate: true
+          path: code-coverage-results.md
+
+  # ──────────────────────────────────────────────────────────────────────────
+  docker:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=true
+
+      - uses: docker/build-push-action@v5
+        with:
+          context:   AuthService
+          file:      AuthService/Dockerfile
+          push:      true
+          tags:      ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+  # ──────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: tag
+        run: echo "TAG=sha-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+
+      - name: Apply manifests
+        run: kubectl apply -f AuthService/k8s/
+
+      - name: Update image
+        run: |
+          kubectl set image deployment/auth-service \
+            auth-service=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.TAG }} \
+            -n fiapx
+
+      - name: Rollout status
+        run: kubectl rollout status deployment/auth-service -n fiapx --timeout=120s

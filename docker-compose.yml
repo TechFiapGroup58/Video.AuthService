@@ -1,0 +1,47 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fiapx-auth-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     fiapx
+      POSTGRES_PASSWORD: fiapx@2024
+      POSTGRES_DB:       fiapx_auth
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fiapx -d fiapx_auth"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fiapx-auth-service
+    restart: unless-stopped
+    ports:
+      - "5000:8080"
+    environment:
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=fiapx_auth;Username=fiapx;Password=fiapx@2024"
+      Jwt__SecretKey:      "fiapx-super-secret-key-at-least-32-chars-long!"
+      Jwt__Issuer:         "fiapx-auth"
+      Jwt__Audience:       "fiapx-services"
+      Jwt__ExpiresMinutes: "60"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  pg_data:
